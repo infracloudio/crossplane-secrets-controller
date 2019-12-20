@@ -1,0 +1,3 @@
+domain: argocd-connector.vadasambar.github.io
+repo: crossplane-secrets-controller
+version: "2"

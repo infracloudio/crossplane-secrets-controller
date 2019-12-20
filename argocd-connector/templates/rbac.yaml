@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-connector-sa
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-connector
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "watch", "list", "create", "update", "patch", "delete"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-connector
+subjects:
+- kind: ServiceAccount
+  name: argocd-connector-sa 
+  namespace: crossplane-system
+  apiGroup: ""
+roleRef:
+  kind: ClusterRole
+  name: argocd-connector
+  apiGroup: rbac.authorization.k8s.io
