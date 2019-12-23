@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/argoproj/argo-cd/common"
@@ -32,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,11 +42,16 @@ import (
 // SecretReconciler reconciles a Secret object
 type SecretReconciler struct {
 	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	Log                 logr.Logger
+	Scheme              *runtime.Scheme
+	CrossplaneNamespace string
+	ArgoCDNamespace     string
 }
 
 const finalizer string = "argocd-connector/finalizers.vadasambar.github.io"
+
+// KubernetesSystemNamespace is the system namespace of kubernetes
+const KubernetesSystemNamespace = "kube-system"
 
 // +kubebuilder:rbac:groups=connectors.argocd-connector.vadasambar.github.io,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=connectors.argocd-connector.vadasambar.github.io,resources=secrets/status,verbs=get;update;patch
@@ -52,7 +59,8 @@ func (r *SecretReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	_ = context.Background()
 	_ = r.Log.WithValues("secret", req.NamespacedName)
 
-	if req.NamespacedName.Namespace != "crossplane-system" {
+
+	if req.NamespacedName.Namespace != r.CrossplaneNamespace {
 		return ctrl.Result{}, nil
 	}
 
@@ -62,125 +70,119 @@ func (r *SecretReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	secret := &v1.Secret{}
 	if err := r.Client.Get(ctx, req.NamespacedName, secret); err != nil {
 		r.Log.Error(err, "could not get the secret", "instance", "SecretReconciler")
-		r.Log.Info("deleting the cluster connection in argocd", "instance", "SecretReconciler")
-		if kerrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, err
+		return ignoreNotFound(err)
 	}
 
 	if !secret.ObjectMeta.DeletionTimestamp.IsZero() {
+		r.Log.Info("deleting the cluster connection in argocd", "instance", "SecretReconciler")
 		err := r.removeClusterFromArgoCD(secret)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		return ctrl.Result{}, nil
 	}
 
-	if len(secret.ObjectMeta.OwnerReferences) > 0 && secret.ObjectMeta.OwnerReferences[0].Kind == "KubernetesCluster" {
+	if isSecretOwnedByCluster(secret) {
 		r.Log.V(0).Info("found cluster connection secret", "secret", req.NamespacedName)
 
-		clusterName := secret.ObjectMeta.OwnerReferences[0].Name
-		kubeConfig := secret.Data["kubeconfig"]
-		externalRestConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeConfig)
+		internalClientSet, err := r.getInternalClientSet()
 		if err != nil {
-			r.Log.Error(err, "could not retrieve rest config from kubeconfig inside the secret", "secret", secret)
-		}
-		r.Log.V(0).Info("extracted rest config from secret", "secret", secret.Name)
-
-		internalRestConfig, err := clientcmd.BuildConfigFromFlags("", "/home/user/.kube/config")
-
-		// internalRestConfig, err := rest.InClusterConfig()
-		if err != nil {
-			r.Log.Error(err, "could not read rest config from inside the argocd cluster", "instance", "Secret Controller")
 			return ctrl.Result{}, nil
 		}
-		internalClientSet, err := kubernetes.NewForConfig(internalRestConfig)
-		if err != nil {
-			r.Log.Error(err, "could not create secrets client for argocd", "instance", "Secret Controller")
+
+		if alreadyExists, err := r.doesArgoCDClusterConnectionAlreadyExists(internalClientSet, secret); err != nil || alreadyExists {
+			return ctrl.Result{}, nil
 		}
 
-		argocdSecrets, err := internalClientSet.CoreV1().Secrets("argocd").List(metav1.ListOptions{})
-		if err != nil {
-			r.Log.Error(err, "could not read secrets from argocd", "instance", "Secret Controller")
-		}
-
-		newClusterSecretName := fmt.Sprintf("cluster-%s-crossplane-%s", clusterName, secret.ObjectMeta.UID)
-		for _, argocdSecret := range argocdSecrets.Items {
-			if argocdSecret.Name == newClusterSecretName && argocdSecret.ObjectMeta.Annotations["crossplane-secret"] == secret.Name {
-				r.Log.Info("cluster already exists in argocd", "secret in argocd", argocdSecret.Name, "crossplane connection secret", secret.Name)
-				return ctrl.Result{}, nil
-			}
-		}
-
-		if err != nil {
-			r.Log.Error(err, "could not get rest config for the controller instance", "instance", "Secret Controller")
-		}
-		externalClientSet, err := kubernetes.NewForConfig(externalRestConfig)
+		externalClientSet, externalRestConfig, err := r.getExternalClientSetWithRestConfig(secret)
 		if err != nil {
 			r.Log.Error(err, "could not create secrets client for provisioned cluster", "instance", "Secret Controller")
+			return ctrl.Result{}, err
 		}
 
-		bearerToken, err := clusterauth.InstallClusterManagerRBAC(externalClientSet, "kube-system")
+		if ctrlResult, err := r.addClusterToArgoCD(externalClientSet, internalClientSet, externalRestConfig, secret); err != nil {
+			return ctrlResult, err
+		}
+
+		if ctrlResult, err := r.addFinalizerToCrossplaneConnectionSecret(secret); err != nil {
+			return ctrlResult, err
+		}
+
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// addFinalizerToCrossplaneConnectionSecret adds finalizer to the crossplane connnection secret
+// this is to ensure argocd cluster connection is deleted when crossplane connection secret is deleted
+func (r *SecretReconciler) addFinalizerToCrossplaneConnectionSecret(secret *v1.Secret) (ctrl.Result, error) {
+	ctx := context.Background()
+	if !containsString(secret.ObjectMeta.Finalizers, finalizer) {
+		secret.ObjectMeta.Finalizers = append(secret.ObjectMeta.Finalizers, finalizer)
+		err := r.Client.Update(ctx, secret)
 		if err != nil {
-			r.Log.Error(err, "could not get bearer token", "instance", "Secret Controller")
+			r.Log.Error(err, "failed to add finalizer to cluster connection secret", "instance", "Secret Controller", "secret", secret.ObjectMeta.Name)
+			return ctrl.Result{}, err
+		} else {
+			r.Log.V(0).Info("added finalizer to cluster connection secret", "instance", "Secret Controller",
+				"secret", secret.ObjectMeta.Name, "finalizer", finalizer)
 		}
+	}
+	return ctrl.Result{}, nil
+}
 
-		argoCluster := argoappsv1.Cluster{
-			Server: externalRestConfig.Host,
-			Name:   newClusterSecretName,
-			Config: argoappsv1.ClusterConfig{
-				BearerToken: bearerToken,
-				TLSClientConfig: argoappsv1.TLSClientConfig{
-					Insecure:   externalRestConfig.TLSClientConfig.Insecure,
-					ServerName: externalRestConfig.TLSClientConfig.ServerName,
-					CAData:     externalRestConfig.TLSClientConfig.CAData,
-				},
-				AWSAuthConfig: nil, // this should read aws config
+// addClusterToArgoCD adds a cluster connection to argocd
+func (r *SecretReconciler) addClusterToArgoCD(externalClientSet *kubernetes.Clientset,
+	internalClientSet *kubernetes.Clientset,
+	externalRestConfig *rest.Config, secret *v1.Secret) (ctrl.Result, error) {
+
+	bearerToken, err := clusterauth.InstallClusterManagerRBAC(externalClientSet, KubernetesSystemNamespace)
+	if err != nil {
+		r.Log.Error(err, "could not get bearer token", "instance", "Secret Controller")
+		return ctrl.Result{Requeue: true}, err
+	}
+
+	argoCluster := argoappsv1.Cluster{
+		Server: externalRestConfig.Host,
+		Name:   getArgoCDConnectionClusterName(secret),
+		Config: argoappsv1.ClusterConfig{
+			BearerToken: bearerToken,
+			TLSClientConfig: argoappsv1.TLSClientConfig{
+				Insecure:   externalRestConfig.TLSClientConfig.Insecure,
+				ServerName: externalRestConfig.TLSClientConfig.ServerName,
+				CAData:     externalRestConfig.TLSClientConfig.CAData,
 			},
-		}
+			AWSAuthConfig: nil, // this should read aws config
+		},
+	}
 
-		// this should be read either from env variable or some other means instead of hard coding
-		secretsClient := internalClientSet.CoreV1().Secrets("argocd")
+	// this should be read either from env variable or some other means instead of hard coding
+	secretsClient := internalClientSet.CoreV1().Secrets(r.ArgoCDNamespace)
 
-		addClusterSecret := &v1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: newClusterSecretName,
-				Labels: map[string]string{
-					common.LabelKeySecretType: common.LabelValueSecretTypeCluster,
-				},
-				Annotations: map[string]string{
-					common.AnnotationKeyManagedBy: common.AnnotationValueManagedByArgoCD,
-					"crossplane-secret":           secret.Name,
-				},
+	addClusterSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: getArgoCDConnectionClusterName(secret),
+			Labels: map[string]string{
+				common.LabelKeySecretType: common.LabelValueSecretTypeCluster,
 			},
+			Annotations: map[string]string{
+				common.AnnotationKeyManagedBy: common.AnnotationValueManagedByArgoCD,
+				"crossplane-secret":           secret.Name,
+			},
+		},
+	}
+
+	addClusterSecret.Data = clusterToData(&argoCluster)
+
+	_, err = secretsClient.Create(addClusterSecret)
+	if err != nil {
+		if !kerrors.IsAlreadyExists(err) {
+			r.Log.Error(err, "could not create secret", "instance", "Secret Controller")
+			return ctrl.Result{
+				Requeue:      true,
+				RequeueAfter: time.Second * 10,
+			}, nil
 		}
-
-		addClusterSecret.Data = clusterToData(&argoCluster)
-
-		_, err = secretsClient.Create(addClusterSecret)
-		if err != nil {
-			if !kerrors.IsAlreadyExists(err) {
-				r.Log.Error(err, "could not create secret", "instance", "Secret Controller")
-				return ctrl.Result{
-					Requeue:      true,
-					RequeueAfter: time.Second * 10,
-				}, nil
-			}
-		}
-
-		r.Log.V(0).Info("FINALIZERS", "OBJECT META", secret.ObjectMeta)
-		if !containsString(secret.ObjectMeta.Finalizers, finalizer) {
-			secret.ObjectMeta.Finalizers = append(secret.ObjectMeta.Finalizers, finalizer)
-			err = r.Client.Update(ctx, secret)
-			if err != nil {
-				r.Log.Error(err, "failed to add finalizer to cluster connection secret", "instance", "Secret Controller", "secret", secret.ObjectMeta.Name)
-				return ctrl.Result{}, nil
-			} else {
-				r.Log.V(0).Info("added finalizer to cluster connection secret", "instance", "Secret Controller",
-					"secret", secret.ObjectMeta.Name, "finalizer", finalizer)
-			}
-		}
-
 	}
 
 	return ctrl.Result{}, nil
@@ -191,13 +193,39 @@ func (r *SecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&v1.Secret{}).
 		Complete(r)
 }
+
+// doesArgoCDClusterConnectionAlreadyExists checks if the crossplane connection secret already has a correspondong cluster connection in argocd
+func (r *SecretReconciler) doesArgoCDClusterConnectionAlreadyExists(internalClientSet *kubernetes.Clientset, secret *v1.Secret) (bool, error) {
+	argocdSecrets, err := internalClientSet.CoreV1().Secrets(r.ArgoCDNamespace).List(metav1.ListOptions{})
+	if err != nil {
+		r.Log.Error(err, "could not read secrets from argocd", "instance", "Secret Controller")
+		return false, err
+	}
+
+	newClusterSecretName := getArgoCDConnectionClusterName(secret)
+	for _, argocdSecret := range argocdSecrets.Items {
+		if argocdSecret.Name == newClusterSecretName && argocdSecret.ObjectMeta.Annotations["crossplane-secret"] == secret.Name {
+			r.Log.Info("cluster already exists in argocd", "secret in argocd", argocdSecret.Name, "crossplane connection secret", secret.Name)
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// getArgoCDConnectionClusterName returns name of the cluster connection to create in argocd
+func getArgoCDConnectionClusterName(secret *v1.Secret) string {
+	clusterName := secret.ObjectMeta.OwnerReferences[0].Name
+	return fmt.Sprintf("cluster-%s-crossplane-%s", clusterName, secret.ObjectMeta.UID)
+}
+
+// removeClusterFromArgoCD removes cluster from argocd if the cluster connection secret has been deleted in crossplane
 func (r *SecretReconciler) removeClusterFromArgoCD(secret *v1.Secret) error {
 
 	clusterName := secret.ObjectMeta.OwnerReferences[0].Name
 	clusterSecretName := fmt.Sprintf("cluster-%s-crossplane-%s", clusterName, secret.ObjectMeta.UID)
 
-	// internalRestConfig, err := rest.InClusterConfig()
-	internalRestConfig, err := clientcmd.BuildConfigFromFlags("", "/home/user/.kube/config")
+	internalRestConfig, err := getInternalRestConfig()
 	if err != nil {
 		r.Log.Error(err, "could not read rest config from inside the argocd cluster", "instance", "Secret Controller")
 		return err
@@ -208,7 +236,7 @@ func (r *SecretReconciler) removeClusterFromArgoCD(secret *v1.Secret) error {
 		return err
 	}
 
-	secretsClient := internalClientSet.CoreV1().Secrets("argocd")
+	secretsClient := internalClientSet.CoreV1().Secrets(r.ArgoCDNamespace)
 	err = secretsClient.Delete(clusterSecretName, &metav1.DeleteOptions{})
 	if err != nil {
 		r.Log.Error(err, "could not remove the cluster from  argocd", "instance", "Secret Controller")
@@ -225,6 +253,7 @@ func (r *SecretReconciler) removeClusterFromArgoCD(secret *v1.Secret) error {
 	return nil
 }
 
+// containsString checks if a slice of string contains the required string
 func containsString(slice []string, str string) bool {
 	for _, elem := range slice {
 		if elem == str {
@@ -235,6 +264,57 @@ func containsString(slice []string, str string) bool {
 	return false
 }
 
+// isSecretOwnedByCluster checks if the secret is a cluster connection secret
+func isSecretOwnedByCluster(secret *v1.Secret) bool {
+	return len(secret.ObjectMeta.OwnerReferences) > 0 && secret.ObjectMeta.OwnerReferences[0].Kind == "KubernetesCluster"
+}
+
+// getExternalClientSetWithRestConfig reads kubeconfig from crossplane connection secret and returns the rest config with clientset
+func (r *SecretReconciler) getExternalClientSetWithRestConfig(secret *v1.Secret) (*kubernetes.Clientset, *rest.Config, error) {
+	kubeConfig := secret.Data["kubeconfig"]
+	externalRestConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeConfig)
+	if err != nil {
+		r.Log.Error(err, "could not retrieve rest config from kubeconfig inside the secret", "secret", secret)
+		return nil, nil, err
+	}
+	r.Log.V(0).Info("extracted rest config from secret", "secret", secret.Name)
+
+	externalClientSet, err := kubernetes.NewForConfig(externalRestConfig)
+	if err != nil {
+		r.Log.Error(err, "could not create secrets client for provisioned cluster", "instance", "Secret Controller")
+		return nil, externalRestConfig, err
+	}
+
+	return externalClientSet, externalRestConfig, nil
+}
+
+// getInternalRestConfig returns rest config depending on if the controller
+// is being run locally or inside a cluster
+func getInternalRestConfig() (*rest.Config, error) {
+	kubeConfigPath := "/home/user/.kube/config"
+	_, err := os.Open(kubeConfigPath)
+	if os.IsNotExist(err) {
+		return rest.InClusterConfig()
+	}
+	return clientcmd.BuildConfigFromFlags("", kubeConfigPath)
+}
+
+// getInternalClientSet returns client set of the cluster where argocd and crossplane are installed
+func (r *SecretReconciler) getInternalClientSet() (*kubernetes.Clientset, error) {
+	internalRestConfig, err := getInternalRestConfig()
+	if err != nil {
+		r.Log.Error(err, "could not read rest config from inside the argocd cluster", "instance", "Secret Controller")
+		return nil, err
+	}
+	internalClientSet, err := kubernetes.NewForConfig(internalRestConfig)
+	if err != nil {
+		r.Log.Error(err, "could not create secrets client for argocd", "instance", "Secret Controller")
+	}
+
+	return internalClientSet, nil
+}
+
+// removeString removes a string from a slice
 func removeString(slice []string, str string) []string {
 	newSlice := []string{}
 	for _, elem := range slice {
@@ -247,6 +327,7 @@ func removeString(slice []string, str string) []string {
 	return newSlice
 }
 
+// clusterToData returns the cluster config required to create a cluster connection in argocd
 func clusterToData(c *appv1.Cluster) map[string][]byte {
 	data := make(map[string][]byte)
 	data["server"] = []byte(c.Server)
@@ -261,4 +342,15 @@ func clusterToData(c *appv1.Cluster) map[string][]byte {
 	}
 	data["config"] = configBytes
 	return data
+}
+
+// ignoreNotFound ignores not found errors
+func ignoreNotFound(err error) (ctrl.Result, error) {
+	if kerrors.IsNotFound(err) {
+		fmt.Println("is not found error. returning without printing anything")
+		return ctrl.Result{}, nil
+	}
+
+	fmt.Println("other than not found error. returning with error")
+	return ctrl.Result{}, err
 }

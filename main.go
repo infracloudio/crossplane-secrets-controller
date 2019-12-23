@@ -18,6 +18,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 
@@ -66,10 +67,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	crossplaneNs := "crossplane-system"
+	if ns := os.Getenv("CROSSPLANE-NAMESPACE"); strings.TrimSpace(ns) != "" {
+		crossplaneNs = ns
+	}
+
+	argocdNs := "argocd"
+	if ns := os.Getenv("ARGOCD-NAMESPACE"); strings.TrimSpace(ns) != "" {
+		argocdNs = ns
+	}
+
 	if err = (&controllers.SecretReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("Secret"),
-		Scheme: mgr.GetScheme(),
+		Client:              mgr.GetClient(),
+		Log:                 ctrl.Log.WithName("controllers").WithName("Secret"),
+		Scheme:              mgr.GetScheme(),
+		CrossplaneNamespace: crossplaneNs,
+		ArgoCDNamespace:     argocdNs,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Secret")
 		os.Exit(1)
