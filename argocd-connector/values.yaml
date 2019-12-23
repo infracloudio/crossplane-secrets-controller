@@ -10,6 +10,8 @@ image:
 
 nameOverride: ""
 fullnameOverride: ""
+crossplaneNamespace: "crossplane-system"
+argocdNamespace: "argocd"
 
 
 resources: {}

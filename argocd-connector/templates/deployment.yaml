@@ -21,6 +21,11 @@ spec:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}   
+          env:
+          - name: CROSSPLANE-NAMESPACE
+            value: "{{ .Values.crossplaneNamespace }}"
+          - name: ARGOCD-NAMESPACE
+            value: "{{ .Values.argocdNamespace }}"
           resources:
 {{ toYaml .Values.resources | indent 12 }}
     {{- with .Values.nodeSelector }}
