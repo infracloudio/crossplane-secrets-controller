@@ -11,8 +11,8 @@ metadata:
   name: argocd-connector
 rules:
 - apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["get", "watch", "list", "create", "update", "patch", "delete"]
+  resources: ["secrets", "configmaps", "events"]
+  verbs: ["*"]
 
 ---
 
