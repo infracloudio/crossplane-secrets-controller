@@ -59,7 +59,6 @@ func (r *SecretReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	_ = context.Background()
 	_ = r.Log.WithValues("secret", req.NamespacedName)
 
-
 	if req.NamespacedName.Namespace != r.CrossplaneNamespace {
 		return ctrl.Result{}, nil
 	}
@@ -136,6 +135,10 @@ func (r *SecretReconciler) addClusterToArgoCD(externalClientSet *kubernetes.Clie
 	internalClientSet *kubernetes.Clientset,
 	externalRestConfig *rest.Config, secret *v1.Secret) (ctrl.Result, error) {
 
+	clusterToAddName := getArgoCDConnectionClusterName(secret)
+	r.Log.V(0).Info("adding cluster to argocd", "instance", "Secret Controller", "cluster name in argocd", clusterToAddName)
+	r.Log.V(0).Info("setting up RBAC in the provisioned cluster", "instance", "Secret Controller")
+
 	bearerToken, err := clusterauth.InstallClusterManagerRBAC(externalClientSet, KubernetesSystemNamespace)
 	if err != nil {
 		r.Log.Error(err, "could not get bearer token", "instance", "Secret Controller")
@@ -144,7 +147,7 @@ func (r *SecretReconciler) addClusterToArgoCD(externalClientSet *kubernetes.Clie
 
 	argoCluster := argoappsv1.Cluster{
 		Server: externalRestConfig.Host,
-		Name:   getArgoCDConnectionClusterName(secret),
+		Name:   clusterToAddName,
 		Config: argoappsv1.ClusterConfig{
 			BearerToken: bearerToken,
 			TLSClientConfig: argoappsv1.TLSClientConfig{
@@ -161,7 +164,7 @@ func (r *SecretReconciler) addClusterToArgoCD(externalClientSet *kubernetes.Clie
 
 	addClusterSecret := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: getArgoCDConnectionClusterName(secret),
+			Name: clusterToAddName,
 			Labels: map[string]string{
 				common.LabelKeySecretType: common.LabelValueSecretTypeCluster,
 			},
@@ -183,7 +186,12 @@ func (r *SecretReconciler) addClusterToArgoCD(externalClientSet *kubernetes.Clie
 				RequeueAfter: time.Second * 10,
 			}, nil
 		}
+
+		r.Log.Error(err, "cluster already exists in argocd", "instance", "Secret Controller")
+		return ctrl.Result{}, err
 	}
+
+	r.Log.V(0).Info("added cluster to argocd", "instance", "Secret Controller", "cluster name in argocd", clusterToAddName)
 
 	return ctrl.Result{}, nil
 }
