@@ -1,0 +1,28 @@
+projectID: "omni-163105"
+
+crossplaneNamespace: "crossplane-system"
+argocdNamespace: "argocd"
+
+providerRef: "gcp-provider"
+
+clusterClass:
+  name: "app-kubernetes-class"
+  location: "us-central1-b"
+  nodePool:
+    name: "gke-nodepool"
+    initialNodeCount: 2
+
+clusterClaim:
+  name: "app-kubernetes"
+  externalName: "barmin"
+  connection:
+    username: "barmin"
+
+application:
+  name: "flask-app"
+  project: "default"
+  path: "."
+  repoUrl: "https://github.com/kanuahs/flask-sample-app"
+  targetRevision: "showandtell"
+  destination:
+    namespace: "default"

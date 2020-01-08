@@ -10,8 +10,8 @@ kind: ClusterRole
 metadata:
   name: argocd-connector
 rules:
-- apiGroups: [""]
-  resources: ["secrets", "configmaps", "events"]
+- apiGroups: ["", "compute.crossplane.io"]
+  resources: ["secrets", "configmaps", "events", "kubernetesclusters"]
   verbs: ["*"]
 
 ---

@@ -1,0 +1,81 @@
+apiVersion: container.gcp.crossplane.io/v1beta1
+kind: GKEClusterClass
+metadata:
+  labels:
+    className: "{{ .Values.clusterClass.name }}"
+  name: {{ .Values.clusterClass.name }}
+  namespace: {{ .Values.crossplaneNamespace }}
+specTemplate:
+  forProvider:
+    location: {{ .Values.clusterClass.location }}
+    masterAuth: 
+      username: {{ .Values.clusterClaim.connection.username }}
+      # clientCertificateConfig: 
+      #   issueClientCertificate: true
+  providerRef:
+    name: {{ .Values.providerRef }}
+  reclaimPolicy: Delete
+  writeConnectionSecretsToNamespace: {{ .Values.crossplaneNamespace }}
+---
+apiVersion: compute.crossplane.io/v1alpha1
+kind: KubernetesCluster
+metadata:
+  name: {{ .Values.clusterClaim.name }}
+  namespace: {{ .Values.crossplaneNamespace }}
+  annotations:
+    crossplane.io/external-name: {{ .Values.clusterClaim.externalName }}
+spec:
+  classSelector:
+    matchLabels:
+      className: "{{ .Values.clusterClass.name }}"
+  # classRef: {{ .Values.clusterClass.name }}
+  writeConnectionSecretToRef:
+    name: {{ .Values.clusterClaim.name }}
+
+---
+
+apiVersion: container.gcp.crossplane.io/v1alpha1
+kind: NodePool
+metadata:
+  name: {{ .Values.clusterClass.nodePool.name }}
+  namespace: {{ .Values.crossplaneNamespace }}
+spec:
+  providerRef:
+    name: {{ .Values.providerRef }}
+  writeConnectionSecretToRef:
+    name: {{ .Values.clusterClass.nodePool.name }}
+    namespace: {{ .Values.crossplaneNamespace }}
+
+  forProvider:
+    # clusterRef:
+    #   name: crossplane-system-app-kubernetes-2-8mrlq # name of the managed resource 
+    # cluster: projects/omni-163105/locations/us-central1/clusters/foobarbaz
+    cluster: "projects/{{- .Values.projectID -}}/locations/{{- .Values.clusterClass.location -}}/clusters/{{- .Values.clusterClaim.externalName -}}"
+    initialNodeCount: {{ .Values.clusterClass.nodePool.initialNodeCount }}
+
+--- 
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Values.application.name }}
+  namespace: {{ .Values.argocdNamespace }}
+  finalizers:
+  - resources-finalizer.argocd.argoproj.io
+spec:
+  destination:
+    namespace: {{ .Values.application.destination.namespace }}
+    name: {{ .Values.clusterClaim.externalName }}
+  project: {{ .Values.application.project }}
+  source:
+    path: {{ .Values.application.path }}
+    repoURL: {{ .Values.application.repoUrl }}
+    targetRevision: {{ .Values.application.targetRevision }}
+    # helm:
+    #   parameters:
+    #     - name: service.type
+    #       value: NodePort
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true
+
