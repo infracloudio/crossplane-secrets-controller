@@ -24,7 +24,7 @@ import (
 
 	"crossplane-secrets-controller/controllers"
 
-	crossplaneapis "github.com/crossplaneio/crossplane/apis"
+	crossplaneapis "github.com/crossplane/crossplane/apis"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"

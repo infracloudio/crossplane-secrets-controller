@@ -28,7 +28,7 @@ import (
 	argoappsv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 
 	"github.com/argoproj/argo-cd/util/clusterauth"
-	crossplanev1alpha1 "github.com/crossplaneio/crossplane/apis/compute/v1alpha1"
+	crossplanev1alpha1 "github.com/crossplane/crossplane/apis/compute/v1alpha1"
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -263,8 +263,11 @@ func autoGenerateArgoCDConnectionClusterName(secret *v1.Secret) string {
 // removeClusterFromArgoCD removes cluster from argocd if the cluster connection secret has been deleted in crossplane
 func (r *SecretReconciler) removeClusterFromArgoCD(secret *v1.Secret) error {
 
-	clusterName := secret.ObjectMeta.OwnerReferences[0].Name
-	clusterSecretName := fmt.Sprintf("cluster-%s-crossplane-%s", clusterName, secret.ObjectMeta.UID)
+	clusterSecretName, err := r.getArgoCDConnectionClusterName(secret)
+	if err != nil {
+		r.Log.Error(err, "could not get external cluster name", "instance", "Secret Controller")
+		return err
+	}
 
 	internalRestConfig, err := getInternalRestConfig()
 	if err != nil {
