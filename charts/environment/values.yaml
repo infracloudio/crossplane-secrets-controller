@@ -6,17 +6,17 @@ argocdNamespace: "argocd"
 providerRef: "gcp-provider"
 
 clusterClass:
-  name: "app-kubernetes-class"
+  name: "app-kubernetes-env2"
   location: "us-central1-b"
   nodePool:
     name: "gke-nodepool"
     initialNodeCount: 2
 
 clusterClaim:
-  name: "app-kubernetes"
-  externalName: "barmin"
+  name: "app-kubernetes-env2"
+  externalName: "barbaz"
   connection:
-    username: "barmin"
+    username: "barbaz"
 
 application:
   name: "flask-app"
