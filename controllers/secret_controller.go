@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"time"
 
 	"github.com/argoproj/argo-cd/common"
@@ -263,11 +264,7 @@ func autoGenerateArgoCDConnectionClusterName(secret *v1.Secret) string {
 // removeClusterFromArgoCD removes cluster from argocd if the cluster connection secret has been deleted in crossplane
 func (r *SecretReconciler) removeClusterFromArgoCD(secret *v1.Secret) error {
 
-	clusterSecretName, err := r.getArgoCDConnectionClusterName(secret)
-	if err != nil {
-		r.Log.Error(err, "could not get external cluster name", "instance", "Secret Controller")
-		return err
-	}
+	clusterSecretName := secret.GetName()
 
 	internalRestConfig, err := getInternalRestConfig()
 	if err != nil {
@@ -283,7 +280,7 @@ func (r *SecretReconciler) removeClusterFromArgoCD(secret *v1.Secret) error {
 	secretsClient := internalClientSet.CoreV1().Secrets(r.ArgoCDNamespace)
 	err = secretsClient.Delete(clusterSecretName, &metav1.DeleteOptions{})
 	if err != nil {
-		r.Log.Error(err, "could not remove the cluster from  argocd", "instance", "Secret Controller")
+		r.Log.Error(err, "could not remove the cluster from  argocd", "instance", "Secret Controller", "cluster name", clusterSecretName)
 		return err
 	}
 
@@ -335,7 +332,11 @@ func (r *SecretReconciler) getExternalClientSetWithRestConfig(secret *v1.Secret)
 // getInternalRestConfig returns rest config depending on if the controller
 // is being run locally or inside a cluster
 func getInternalRestConfig() (*rest.Config, error) {
-	kubeConfigPath := "/home/user/.kube/config"
+	homeDir, homeDirErr := os.UserHomeDir()
+	if homeDirErr != nil {
+		return nil, fmt.Errorf("could not get home directory to read rest config from")
+	}
+	kubeConfigPath := path.Join(homeDir, ".kube/config")
 	_, err := os.Open(kubeConfigPath)
 	if os.IsNotExist(err) {
 		return rest.InClusterConfig()
