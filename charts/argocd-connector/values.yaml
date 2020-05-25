@@ -5,7 +5,7 @@
 replicaCount: 2
 
 image:
-  repository: argocd-connector
+  repository: vadasambar/argocd-connector
   pullPolicy: IfNotPresent
 
 nameOverride: ""
